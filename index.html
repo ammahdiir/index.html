@@ -1,0 +1,1534 @@
+<!DOCTYPE html>
+<!--
+  Optical Link Benchmark v3
+  Standalone / Offline
+  No external dependencies
+
+  Changelog v2 -> v3:
+  - Added a 3-second start countdown on both Sender and Receiver.
+  - Added a real pre-test "link verification" gate: the Receiver will not
+    enable START until it has actually decoded valid protocol frames from
+    the Sender (proving the Grid size / format matches and the optical
+    link works) — not just "found 4 markers".
+  - Fixed a real bug: non-DATA frames (calibration/idle frames) could be
+    counted into benchmark statistics if they were received during the
+    counted window, corrupting results. Only TYPE_DATA frames are now
+    counted toward Detected/Valid/Duplicate/CRC/Payload statistics.
+  - If the link drops during the countdown, the benchmark is aborted
+    with a clear message instead of silently producing a zero/garbage
+    report.
+  - Hardened the finder-marker locator (corner blobs must have similar
+    area to each other) to reduce false-positive marker detection.
+-->
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Optical Link Benchmark v3</title>
+<style>
+  :root{
+    --bg:#0b0e14;
+    --panel:#131826;
+    --panel2:#1a2234;
+    --border:#2a3550;
+    --text:#e6ebf5;
+    --muted:#8a94ab;
+    --accent:#4fd1c5;
+    --accent2:#7c9eff;
+    --danger:#ff6b6b;
+    --warn:#ffb454;
+    --ok:#5fe38a;
+    --mono:'Consolas','Menlo','Courier New',monospace;
+  }
+  *{box-sizing:border-box;}
+  html,body{
+    margin:0;padding:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,'Segoe UI',Tahoma,Arial,sans-serif;
+    min-height:100%;
+    overscroll-behavior:none;
+  }
+  #app{display:flex;flex-direction:column;min-height:100vh;}
+  header{
+    padding:10px 16px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;
+    background:linear-gradient(180deg,var(--panel),var(--bg));
+  }
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px;color:var(--text);}
+  header .sub{font-size:11px;color:var(--muted);font-family:var(--mono);}
+  main{flex:1;display:flex;flex-direction:column;}
+  .hidden{display:none !important;}
+
+  /* ---- Config panel ---- */
+  .panel{
+    background:var(--panel);border:1px solid var(--border);border-radius:10px;
+    padding:14px;margin:12px;
+  }
+  .row{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:10px;}
+  .field{display:flex;flex-direction:column;gap:6px;min-width:120px;}
+  .field label{font-size:11px;color:var(--muted);}
+  select,button{
+    font-family:inherit;font-size:13px;border-radius:8px;border:1px solid var(--border);
+    background:var(--panel2);color:var(--text);padding:8px 10px;
+  }
+  select{min-width:120px;}
+  button{cursor:pointer;transition:filter .15s ease;}
+  button:hover{filter:brightness(1.15);}
+  button:disabled{opacity:.4;cursor:not-allowed;}
+  .btn-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;}
+  .btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04121a;border:none;font-weight:600;}
+  .btn-danger{background:#3a1420;border-color:#5c2030;color:var(--danger);}
+  .btn-ghost{background:transparent;}
+  .role-toggle{display:flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;}
+  .role-toggle button{border:none;border-radius:0;background:var(--panel2);}
+  .role-toggle button.active{background:var(--accent);color:#04121a;font-weight:700;}
+
+  .status-line{font-size:12px;color:var(--muted);font-family:var(--mono);margin-top:4px;}
+  .status-line.warn{color:var(--warn);}
+  .status-line.err{color:var(--danger);}
+  .status-line.ok{color:var(--ok);}
+  .error-box{
+    background:#2a1218;border:1px solid #5c2030;color:#ffb4b4;padding:10px 12px;
+    border-radius:8px;font-size:12px;margin:12px;font-family:var(--mono);white-space:pre-wrap;
+  }
+
+  /* ---- Sender view ---- */
+  #senderView{position:fixed;inset:0;background:#000;display:none;flex-direction:column;align-items:center;justify-content:center;z-index:50;}
+  #senderView.active{display:flex;}
+  #senderCanvas{
+    image-rendering:pixelated;
+    image-rendering:-moz-crisp-edges;
+    image-rendering:crisp-edges;
+    background:#000;
+    box-shadow:0 0 0 2px #000;
+  }
+  #senderBar{
+    position:absolute;bottom:0;left:0;right:0;
+    display:flex;align-items:center;justify-content:space-between;gap:10px;
+    padding:8px 14px;background:rgba(10,12,18,.85);border-top:1px solid var(--border);
+    font-family:var(--mono);font-size:11px;color:var(--muted);flex-wrap:wrap;
+  }
+  #senderBar.countdown{background:rgba(79,209,197,.18);}
+  #senderBarMid{font-size:14px;font-weight:700;color:var(--accent);}
+
+  /* ---- Receiver view ---- */
+  .rx-grid{display:grid;grid-template-columns:1fr;gap:12px;padding:0 12px 12px;}
+  @media(min-width:840px){ .rx-grid{grid-template-columns:1.1fr .9fr;} }
+  .video-wrap{position:relative;background:#000;border-radius:10px;overflow:hidden;border:1px solid var(--border);}
+  .video-wrap video{width:100%;display:block;background:#000;}
+  .video-wrap canvas.overlay{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;}
+  .calib-badge{
+    position:absolute;top:8px;left:8px;padding:4px 10px;border-radius:20px;font-size:11px;
+    font-family:var(--mono);font-weight:700;letter-spacing:.5px;background:rgba(0,0,0,.55);
+    max-width:80%;
+  }
+  .calib-badge.waiting{color:var(--warn);}
+  .calib-badge.progress{color:var(--accent2);}
+  .calib-badge.ok{color:var(--ok);}
+  .calib-badge.lost{color:var(--danger);}
+  .cam-info{position:absolute;bottom:8px;left:8px;font-family:var(--mono);font-size:10.5px;color:#cfe;background:rgba(0,0,0,.5);padding:3px 8px;border-radius:6px;}
+
+  .dashboard{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;}
+  .dashboard h3{margin:0 0 10px;font-size:13px;color:var(--accent);}
+  .stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+  .stat{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:8px 10px;}
+  .stat .k{font-size:10.5px;color:var(--muted);}
+  .stat .v{font-size:16px;font-family:var(--mono);font-weight:700;margin-top:2px;}
+  .stat .v.err{color:var(--danger);}
+  .stat .v.warn{color:var(--warn);}
+  .stat .v.ok{color:var(--ok);}
+
+  #reportBox{
+    margin:12px;background:#05080c;border:1px solid var(--border);border-radius:10px;
+    padding:14px;font-family:var(--mono);font-size:12.5px;white-space:pre;overflow-x:auto;color:var(--ok);
+  }
+  .debug-panel{margin-top:10px;background:#05080c;border:1px solid var(--border);border-radius:8px;padding:10px;font-family:var(--mono);font-size:11px;color:#9fd6c8;white-space:pre-wrap;}
+  .checkline{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:8px;}
+  footer{padding:10px 16px;color:var(--muted);font-size:10.5px;text-align:center;font-family:var(--mono);}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div>
+      <h1>Optical Link Benchmark v3</h1>
+      <div class="sub">Screen → Camera optical data channel · standalone / offline</div>
+    </div>
+    <div class="role-toggle" id="roleToggle">
+      <button id="roleSenderBtn" class="active">Sender</button>
+      <button id="roleReceiverBtn">Receiver</button>
+    </div>
+  </header>
+
+  <div id="errorBox" class="error-box hidden"></div>
+
+  <main>
+    <section class="panel">
+      <div class="row">
+        <div class="field">
+          <label>Grid (باید در هر دو دستگاه یکسان باشد)</label>
+          <select id="gridSelect">
+            <option value="16">16 × 16</option>
+            <option value="24">24 × 24</option>
+            <option value="32" selected>32 × 32</option>
+            <option value="40">40 × 40</option>
+            <option value="48">48 × 48</option>
+          </select>
+        </div>
+        <div class="field" id="fpsField">
+          <label>Target FPS (Sender)</label>
+          <select id="fpsSelect">
+            <option value="5">5</option>
+            <option value="10">10</option>
+            <option value="15" selected>15</option>
+            <option value="20">20</option>
+            <option value="30">30</option>
+            <option value="60">60</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Test Duration</label>
+          <select id="durationSelect">
+            <option value="10">10 sec</option>
+            <option value="30" selected>30 sec</option>
+            <option value="60">60 sec</option>
+            <option value="120">120 sec</option>
+          </select>
+        </div>
+        <div class="field" id="capacityField">
+          <label>Payload / Frame</label>
+          <div class="status-line" id="capacityLine" style="margin-top:9px;">—</div>
+        </div>
+      </div>
+
+      <!-- Sender-only controls -->
+      <div id="senderControls">
+        <div class="btn-row">
+          <button id="calibPatternBtn" class="btn-ghost">Calibration Pattern</button>
+          <button id="senderStartBtn" class="btn-primary">START</button>
+          <button id="senderStopBtn" class="btn-danger" disabled>STOP</button>
+        </div>
+        <div class="status-line" id="senderStatusLine">Idle.</div>
+      </div>
+
+      <!-- Receiver-only controls -->
+      <div id="receiverControls" class="hidden">
+        <div class="btn-row">
+          <button id="enableCameraBtn" class="btn-ghost">Enable Camera</button>
+          <button id="receiverStartBtn" class="btn-primary" disabled>START</button>
+          <button id="receiverStopBtn" class="btn-danger" disabled>STOP</button>
+        </div>
+        <div class="checkline"><input type="checkbox" id="debugCheckbox"> <label for="debugCheckbox">Debug</label></div>
+        <div class="status-line" id="receiverStatusLine">دوربین فعال نیست.</div>
+      </div>
+    </section>
+
+    <!-- Receiver live view -->
+    <section id="receiverView" class="hidden">
+      <div class="rx-grid">
+        <div class="video-wrap">
+          <video id="video" playsinline muted autoplay></video>
+          <canvas id="overlayCanvas" class="overlay"></canvas>
+          <div id="calibBadge" class="calib-badge waiting">در جستجوی نشانگر نوری…</div>
+          <div id="camInfo" class="cam-info">Camera: —</div>
+        </div>
+        <div class="dashboard">
+          <h3>Live Dashboard</h3>
+          <div class="stat-grid">
+            <div class="stat"><div class="k">Elapsed</div><div class="v" id="stElapsed">0.00 sec</div></div>
+            <div class="stat"><div class="k">Detected FPS</div><div class="v" id="stDetFps">0.0</div></div>
+            <div class="stat"><div class="k">Valid FPS</div><div class="v ok" id="stValFps">0.0</div></div>
+            <div class="stat"><div class="k">Valid Frames</div><div class="v" id="stValFrames">0</div></div>
+            <div class="stat"><div class="k">Payload</div><div class="v" id="stPayload">0.0 KiB</div></div>
+            <div class="stat"><div class="k">Payload Rate</div><div class="v ok" id="stPayloadRate">0.00 KiB/s</div></div>
+            <div class="stat"><div class="k">Raw Rate</div><div class="v" id="stRawRate">0.00 KiB/s</div></div>
+            <div class="stat"><div class="k">CRC Errors</div><div class="v err" id="stCrcErr">0</div></div>
+            <div class="stat"><div class="k">Duplicates</div><div class="v warn" id="stDup">0</div></div>
+            <div class="stat"><div class="k">Out of Order</div><div class="v warn" id="stOoo">0</div></div>
+          </div>
+          <div id="debugPanel" class="debug-panel hidden">Debug: waiting…</div>
+        </div>
+      </div>
+    </section>
+
+    <pre id="reportBox" class="hidden"></pre>
+  </main>
+
+  <footer>No network · no server · no external libraries · light is the only channel</footer>
+</div>
+
+<!-- ================= SENDER FULLSCREEN VIEW ================= -->
+<div id="senderView">
+  <canvas id="senderCanvas"></canvas>
+  <div id="senderBar">
+    <span id="senderBarLeft">MODE: —</span>
+    <span id="senderBarMid">SEQ: 0</span>
+    <span id="senderBarRight">FPS: 0.0</span>
+    <button id="senderExitBtn" class="btn-danger">STOP</button>
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* =========================================================================
+   0. GLOBAL CONSTANTS
+   ========================================================================= */
+var MAGIC0 = 0x4F, MAGIC1 = 0x4C; // 'O','L'
+var VERSION = 1;
+var TYPE_CALIBRATION = 0x00; // idle / link-check frame (also used during countdown)
+var TYPE_DATA = 0x01;        // counted benchmark frame
+var HEADER_BYTES = 10; // MAGIC(2)+VERSION(1)+TYPE(1)+SEQ(4)+LEN(2)
+var CRC_BYTES = 4;
+var CANONICAL_CELL_PX = 8; // px per cell in canonical (rectified) space
+var PROCESSING_MAX_WIDTH = 480; // limit processing canvas resolution
+var STABLE_CALIB_FRAMES = 5; // consecutive successful locates required for "marker lock"
+var LOST_CALIB_FRAMES = 10; // consecutive failures before dropping marker lock
+var COUNTDOWN_SECONDS = 3; // start countdown shown on both devices
+var FORMAT_VERIFY_WINDOW_MS = 3500;  // rolling window used to confirm link works
+var FORMAT_VERIFY_MIN_SUCCESS = 3;   // valid decodes required within that window
+
+function clamp(v,a,b){ return v<a?a:(v>b?b:v); }
+function now(){ return performance.now(); }
+
+/* =========================================================================
+   1. CRC32
+   ========================================================================= */
+var CRC32 = (function(){
+  var table = new Uint32Array(256);
+  for (var n=0;n<256;n++){
+    var c = n;
+    for (var k=0;k<8;k++){
+      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[n] = c >>> 0;
+  }
+  function compute(bytes, len){
+    len = (len === undefined) ? bytes.length : len;
+    var crc = 0xFFFFFFFF;
+    for (var i=0;i<len;i++){
+      crc = table[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+  return { compute: compute };
+})();
+
+/* =========================================================================
+   2. BIT UTILITIES
+   ========================================================================= */
+var BitUtils = {
+  bytesToBits: function(bytes){
+    var bits = new Uint8Array(bytes.length*8);
+    var idx = 0;
+    for (var i=0;i<bytes.length;i++){
+      var b = bytes[i];
+      for (var bitPos=7; bitPos>=0; bitPos--){
+        bits[idx++] = (b >> bitPos) & 1;
+      }
+    }
+    return bits;
+  },
+  bitsToBytes: function(bits){
+    var n = Math.floor(bits.length/8);
+    var out = new Uint8Array(n);
+    for (var i=0;i<n;i++){
+      var v = 0;
+      for (var j=0;j<8;j++){
+        v = (v<<1) | (bits[i*8+j] & 1);
+      }
+      out[i] = v;
+    }
+    return out;
+  },
+  writeU32LE: function(arr, offset, val){
+    arr[offset] = val & 0xFF;
+    arr[offset+1] = (val>>>8) & 0xFF;
+    arr[offset+2] = (val>>>16) & 0xFF;
+    arr[offset+3] = (val>>>24) & 0xFF;
+  },
+  readU32LE: function(arr, offset){
+    return (arr[offset] | (arr[offset+1]<<8) | (arr[offset+2]<<16) | (arr[offset+3]<<24)) >>> 0;
+  },
+  writeU16LE: function(arr, offset, val){
+    arr[offset] = val & 0xFF;
+    arr[offset+1] = (val>>>8) & 0xFF;
+  },
+  readU16LE: function(arr, offset){
+    return (arr[offset] | (arr[offset+1]<<8)) & 0xFFFF;
+  }
+};
+
+/* =========================================================================
+   3. DETERMINISTIC PSEUDO-RANDOM PAYLOAD (splitmix32-based)
+   ========================================================================= */
+function makeSplitMix32(seed){
+  var state = seed >>> 0;
+  return function next(){
+    state = (state + 0x9E3779B9) >>> 0;
+    var z = state;
+    z = Math.imul(z ^ (z >>> 16), 0x21F0AAAD) >>> 0;
+    z = Math.imul(z ^ (z >>> 15), 0x735A2D97) >>> 0;
+    z = (z ^ (z >>> 15)) >>> 0;
+    return z >>> 0;
+  };
+}
+function generatePayload(sequence, length){
+  var out = new Uint8Array(length);
+  if (length <= 0) return out;
+  var rng = makeSplitMix32((sequence ^ 0xA53CDE71) >>> 0);
+  var i = 0;
+  while (i < length){
+    var v = rng();
+    out[i++] = v & 0xFF; if (i>=length) break;
+    out[i++] = (v>>>8) & 0xFF; if (i>=length) break;
+    out[i++] = (v>>>16) & 0xFF; if (i>=length) break;
+    out[i++] = (v>>>24) & 0xFF;
+  }
+  return out;
+}
+
+/* =========================================================================
+   4. GRID PLAN — layout of finder markers / quiet zone / data cells
+   ========================================================================= */
+var GridPlan = (function(){
+  var cache = {};
+  function markerSizeFor(G){
+    return Math.max(2, Math.round(G/12));
+  }
+  function build(G){
+    if (cache[G]) return cache[G];
+    var markerSize = markerSizeFor(G);
+    var reserved = markerSize + 1; // marker + 1-cell quiet ring, as an L-shaped corner block
+
+    function isMarker(r,c){
+      return (r < markerSize && c < markerSize) ||
+             (r < markerSize && c >= G-markerSize) ||
+             (r >= G-markerSize && c < markerSize) ||
+             (r >= G-markerSize && c >= G-markerSize);
+    }
+    function isReservedCorner(r,c){
+      return (r < reserved && c < reserved) ||
+             (r < reserved && c >= G-reserved) ||
+             (r >= G-reserved && c < reserved) ||
+             (r >= G-reserved && c >= G-reserved);
+    }
+
+    var dataCells = [];
+    var quietCells = [];
+    var cellType = new Uint8Array(G*G); // 0=data 1=marker 2=quiet
+    for (var r=0;r<G;r++){
+      for (var c=0;c<G;c++){
+        var idx = r*G+c;
+        if (isMarker(r,c)){
+          cellType[idx] = 1;
+        } else if (isReservedCorner(r,c)){
+          cellType[idx] = 2;
+          quietCells.push({r:r,c:c});
+        } else {
+          cellType[idx] = 0;
+          dataCells.push({r:r,c:c});
+        }
+      }
+    }
+    var plan = {
+      G: G,
+      markerSize: markerSize,
+      reserved: reserved,
+      cellType: cellType,
+      dataCells: dataCells,
+      quietCells: quietCells,
+      cellPx: CANONICAL_CELL_PX,
+      canonicalSize: G * CANONICAL_CELL_PX,
+      dataCapacityBits: dataCells.length
+    };
+    cache[G] = plan;
+    return plan;
+  }
+  return { build: build };
+})();
+
+/* =========================================================================
+   5. OPTICAL PROTOCOL — frame encode / decode
+   ========================================================================= */
+var OpticalProtocol = {
+  payloadCapacityBytes: function(plan){
+    var bits = plan.dataCapacityBits;
+    var bytes = Math.floor(bits/8);
+    var cap = bytes - HEADER_BYTES - CRC_BYTES;
+    return Math.max(0, cap);
+  },
+  encodeFrame: function(type, sequence, plan){
+    var payloadLen = (type === TYPE_DATA) ? this.payloadCapacityBytes(plan) : 0;
+    var payload = (type === TYPE_DATA) ? generatePayload(sequence, payloadLen) : new Uint8Array(0);
+    var total = HEADER_BYTES + payloadLen + CRC_BYTES;
+    var bytes = new Uint8Array(total);
+    bytes[0] = MAGIC0; bytes[1] = MAGIC1;
+    bytes[2] = VERSION;
+    bytes[3] = type;
+    BitUtils.writeU32LE(bytes, 4, sequence >>> 0);
+    BitUtils.writeU16LE(bytes, 8, payloadLen & 0xFFFF);
+    for (var i=0;i<payloadLen;i++) bytes[HEADER_BYTES+i] = payload[i];
+    var crc = CRC32.compute(bytes, HEADER_BYTES + payloadLen);
+    BitUtils.writeU32LE(bytes, HEADER_BYTES+payloadLen, crc);
+    return bytes;
+  },
+  // Decode raw bytes (already extracted from bit grid, length = full capacity bytes)
+  decodeFrame: function(bytes){
+    var res = { magicOk:false, valid:false, type:0, sequence:0, length:0, payload:null, crcOk:false, payloadVerified:false };
+    if (bytes.length < HEADER_BYTES + CRC_BYTES) return res;
+    if (bytes[0] !== MAGIC0 || bytes[1] !== MAGIC1) return res;
+    res.magicOk = true;
+    res.version = bytes[2];
+    res.type = bytes[3];
+    res.sequence = BitUtils.readU32LE(bytes, 4) >>> 0;
+    var len = BitUtils.readU16LE(bytes, 8);
+    if (HEADER_BYTES + len + CRC_BYTES > bytes.length){
+      res.length = len;
+      return res; // malformed length, cannot be valid
+    }
+    res.length = len;
+    var payload = bytes.slice(HEADER_BYTES, HEADER_BYTES+len);
+    res.payload = payload;
+    var crcRead = BitUtils.readU32LE(bytes, HEADER_BYTES+len);
+    var crcCalc = CRC32.compute(bytes, HEADER_BYTES+len);
+    res.crcOk = (crcRead === crcCalc);
+    res.valid = res.crcOk;
+    if (res.valid && res.type === TYPE_DATA && len > 0){
+      var expected = generatePayload(res.sequence, len);
+      var match = true;
+      for (var i=0;i<len;i++){ if (expected[i] !== payload[i]){ match=false; break; } }
+      res.payloadVerified = match;
+    }
+    return res;
+  }
+};
+
+/* =========================================================================
+   6. FRAME ENCODER — render bit grid to an offscreen GxG bitmap
+   ========================================================================= */
+var FrameEncoder = {
+  renderBitmap: function(plan, frameBytes){
+    var G = plan.G;
+    var img = new Uint8ClampedArray(G*G*4);
+    // default fill: white
+    for (var i=0;i<G*G;i++){
+      var o = i*4;
+      img[o]=255; img[o+1]=255; img[o+2]=255; img[o+3]=255;
+    }
+    // markers -> black
+    for (var r=0;r<G;r++){
+      for (var c=0;c<G;c++){
+        var idx = r*G+c;
+        if (plan.cellType[idx] === 1){
+          var o2 = idx*4;
+          img[o2]=0; img[o2+1]=0; img[o2+2]=0; img[o2+3]=255;
+        }
+      }
+    }
+    // data cells -> from bits
+    var bits = (frameBytes && frameBytes.length) ? BitUtils.bytesToBits(frameBytes) : null;
+    var dataCells = plan.dataCells;
+    for (var k=0;k<dataCells.length;k++){
+      var cell = dataCells[k];
+      var idx2 = cell.r*G+cell.c;
+      var bit = bits ? bits[k] : 1;
+      var val = bit ? 255 : 0; // 1=WHITE, 0=BLACK
+      var o3 = idx2*4;
+      img[o3]=val; img[o3+1]=val; img[o3+2]=val; img[o3+3]=255;
+    }
+    return new ImageData(img, G, G);
+  }
+};
+
+/* =========================================================================
+   7. LINEAR SOLVER (Gauss-Jordan with partial pivoting)
+   ========================================================================= */
+function solveLinear(Ain, bin){
+  var n = bin.length;
+  var M = [];
+  for (var i=0;i<n;i++){
+    var row = Ain[i].slice();
+    row.push(bin[i]);
+    M.push(row);
+  }
+  for (var col=0; col<n; col++){
+    var maxRow = col, maxVal = Math.abs(M[col][col]);
+    for (var r=col+1;r<n;r++){
+      var av = Math.abs(M[r][col]);
+      if (av > maxVal){ maxVal = av; maxRow = r; }
+    }
+    if (maxVal < 1e-9) return null;
+    if (maxRow !== col){ var tmp = M[col]; M[col] = M[maxRow]; M[maxRow] = tmp; }
+    var pivot = M[col][col];
+    for (var c=col;c<=n;c++) M[col][c] /= pivot;
+    for (var r2=0;r2<n;r2++){
+      if (r2 === col) continue;
+      var factor = M[r2][col];
+      if (factor === 0) continue;
+      for (var c2=col;c2<=n;c2++) M[r2][c2] -= factor * M[col][c2];
+    }
+  }
+  var sol = new Array(n);
+  for (var i2=0;i2<n;i2++) sol[i2] = M[i2][n];
+  return sol;
+}
+
+/* =========================================================================
+   8. HOMOGRAPHY — maps canonical(x,y) -> image(u,v)
+   ========================================================================= */
+var Homography = {
+  // srcCanonical, dstImage: arrays of 4 points [{x,y}] in matching order
+  compute: function(srcCanonical, dstImage){
+    var A = [], b = [];
+    for (var i=0;i<4;i++){
+      var x = srcCanonical[i].x, y = srcCanonical[i].y;
+      var u = dstImage[i].x, v = dstImage[i].y;
+      A.push([x, y, 1, 0, 0, 0, -u*x, -u*y]); b.push(u);
+      A.push([0, 0, 0, x, y, 1, -v*x, -v*y]); b.push(v);
+    }
+    var sol = solveLinear(A, b);
+    if (!sol) return null;
+    return { a:sol[0], b:sol[1], c:sol[2], d:sol[3], e:sol[4], f:sol[5], g:sol[6], h:sol[7] };
+  },
+  apply: function(H, x, y){
+    var denom = H.g*x + H.h*y + 1;
+    if (Math.abs(denom) < 1e-9) return null;
+    var u = (H.a*x + H.b*y + H.c) / denom;
+    var v = (H.d*x + H.e*y + H.f) / denom;
+    return { x:u, y:v };
+  }
+};
+
+/* =========================================================================
+   9. IMAGE OPS — grayscale + Otsu threshold
+   ========================================================================= */
+var ImageOps = {
+  toGrayscale: function(imageData){
+    var d = imageData.data;
+    var w = imageData.width, h = imageData.height;
+    var gray = new Float32Array(w*h);
+    for (var i=0, p=0; i<d.length; i+=4, p++){
+      gray[p] = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+    }
+    return gray;
+  },
+  otsuThreshold: function(gray){
+    var hist = new Uint32Array(256);
+    for (var i=0;i<gray.length;i++) hist[gray[i]|0]++;
+    var total = gray.length;
+    var sum = 0;
+    for (var t=0;t<256;t++) sum += t*hist[t];
+    var sumB=0, wB=0, maxVar=0, threshold=127;
+    for (var t2=0;t2<256;t2++){
+      wB += hist[t2];
+      if (wB === 0) continue;
+      var wF = total - wB;
+      if (wF === 0) break;
+      sumB += t2*hist[t2];
+      var mB = sumB/wB;
+      var mF = (sum-sumB)/wF;
+      var varBetween = wB*wF*(mB-mF)*(mB-mF);
+      if (varBetween > maxVar){ maxVar = varBetween; threshold = t2; }
+    }
+    return threshold;
+  }
+};
+
+/* =========================================================================
+   10. BLOB DETECTOR — connected components on binary mask
+   ========================================================================= */
+function findBlobs(gray, w, h, threshold){
+  var n = w*h;
+  var visited = new Uint8Array(n);
+  var isFg = function(idx){ return gray[idx] < threshold; };
+  var blobs = [];
+  var stackX = new Int32Array(n);
+  var stackY = new Int32Array(n);
+  for (var y=0; y<h; y++){
+    for (var x=0; x<w; x++){
+      var idx0 = y*w+x;
+      if (visited[idx0] || !isFg(idx0)) continue;
+      var sp = 0;
+      stackX[sp]=x; stackY[sp]=y; sp++;
+      visited[idx0]=1;
+      var minX=x, maxX=x, minY=y, maxY=y, area=0, sumI=0;
+      while (sp > 0){
+        sp--;
+        var cx = stackX[sp], cy = stackY[sp];
+        var cidx = cy*w+cx;
+        area++; sumI += gray[cidx];
+        if (cx<minX) minX=cx; if (cx>maxX) maxX=cx;
+        if (cy<minY) minY=cy; if (cy>maxY) maxY=cy;
+        // 4-neighbors
+        if (cx+1<w){ var i1=cidx+1; if(!visited[i1] && isFg(i1)){visited[i1]=1; stackX[sp]=cx+1; stackY[sp]=cy; sp++;} }
+        if (cx-1>=0){ var i2=cidx-1; if(!visited[i2] && isFg(i2)){visited[i2]=1; stackX[sp]=cx-1; stackY[sp]=cy; sp++;} }
+        if (cy+1<h){ var i3=cidx+w; if(!visited[i3] && isFg(i3)){visited[i3]=1; stackX[sp]=cx; stackY[sp]=cy+1; sp++;} }
+        if (cy-1>=0){ var i4=cidx-w; if(!visited[i4] && isFg(i4)){visited[i4]=1; stackX[sp]=cx; stackY[sp]=cy-1; sp++;} }
+      }
+      blobs.push({
+        minX:minX, maxX:maxX, minY:minY, maxY:maxY,
+        width: maxX-minX+1, height: maxY-minY+1,
+        area: area, avgIntensity: sumI/area
+      });
+    }
+  }
+  return blobs;
+}
+
+/* =========================================================================
+   11. FRAME LOCATOR — find 4 corner markers + build homography
+   ========================================================================= */
+var FrameLocator = {
+  locate: function(gray, w, h){
+    var threshold = ImageOps.otsuThreshold(gray);
+    var blobs = findBlobs(gray, w, h, threshold);
+    var imgArea = w*h;
+    var minArea = imgArea * 0.0012;
+    var maxArea = imgArea * 0.22;
+    var candidates = [];
+    for (var i=0;i<blobs.length;i++){
+      var bl = blobs[i];
+      if (bl.area < minArea || bl.area > maxArea) continue;
+      var fillRatio = bl.area / (bl.width*bl.height);
+      var aspect = bl.width / bl.height;
+      if (fillRatio < 0.62) continue;
+      if (aspect < 0.65 || aspect > 1.55) continue;
+      candidates.push(bl);
+    }
+    if (candidates.length < 4) return { success:false, reason:'insufficient_markers', threshold:threshold };
+    candidates.sort(function(a,b){ return b.area - a.area; });
+    var pool = candidates.slice(0, Math.min(candidates.length, 24));
+
+    function cx(b){ return (b.minX+b.maxX)/2; }
+    function cy(b){ return (b.minY+b.maxY)/2; }
+
+    var iTL=-1,iTR=-1,iBL=-1,iBR=-1;
+    var vTL=Infinity, vBR=-Infinity, vTR=-Infinity, vBL=Infinity;
+    for (var k=0;k<pool.length;k++){
+      var b = pool[k];
+      var sxy = cx(b)+cy(b);
+      var dxy = cx(b)-cy(b);
+      if (sxy < vTL){ vTL = sxy; iTL = k; }
+      if (sxy > vBR){ vBR = sxy; iBR = k; }
+      if (dxy > vTR){ vTR = dxy; iTR = k; }
+      if (dxy < vBL){ vBL = dxy; iBL = k; }
+    }
+    if (iTL<0||iTR<0||iBL<0||iBR<0) return { success:false, reason:'label_failed', threshold:threshold };
+    var idxSet = {}; idxSet[iTL]=1; idxSet[iTR]=1; idxSet[iBL]=1; idxSet[iBR]=1;
+    if (Object.keys(idxSet).length < 4) return { success:false, reason:'degenerate_quad', threshold:threshold };
+
+    var bTL = pool[iTL], bTR = pool[iTR], bBL = pool[iBL], bBR = pool[iBR];
+
+    // sanity: the 4 corner markers should all be roughly the same physical
+    // size. If not, we probably picked up random data-cell clutter instead
+    // of the real finder markers — reject rather than feed a bogus quad
+    // into the homography solver (this was a real source of garbage decodes).
+    var areas = [bTL.area, bTR.area, bBL.area, bBR.area];
+    var aMin = Math.min.apply(null, areas), aMax = Math.max.apply(null, areas);
+    if (aMax / aMin > 3.0) return { success:false, reason:'area_mismatch', threshold:threshold };
+
+    // outer corner of each marker blob = true frame corner in image space
+    var pTL = { x: bTL.minX, y: bTL.minY };
+    var pTR = { x: bTR.maxX, y: bTR.minY };
+    var pBL = { x: bBL.minX, y: bBL.maxY };
+    var pBR = { x: bBR.maxX, y: bBR.maxY };
+
+    // sanity: quad area must be reasonably large
+    var quadArea = Math.abs(
+      (pTR.x-pTL.x)*(pBL.y-pTL.y) - (pBL.x-pTL.x)*(pTR.y-pTL.y)
+    );
+    if (quadArea < imgArea * 0.01) return { success:false, reason:'quad_too_small', threshold:threshold };
+
+    var blackRef = (bTL.avgIntensity + bTR.avgIntensity + bBL.avgIntensity + bBR.avgIntensity) / 4;
+
+    return {
+      success:true,
+      threshold: threshold,
+      corners: { TL:pTL, TR:pTR, BL:pBL, BR:pBR },
+      blackRef: blackRef
+    };
+  }
+};
+
+/* =========================================================================
+   12. CAMERA MANAGER
+   ========================================================================= */
+var CameraManager = {
+  stream: null,
+  track: null,
+  start: function(videoEl){
+    var self = this;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      return Promise.reject(new Error('NO_MEDIA_API'));
+    }
+    var constraints = {
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
+      },
+      audio: false
+    };
+    return navigator.mediaDevices.getUserMedia(constraints)
+      .catch(function(){
+        // fallback to any camera / lower resolution
+        return navigator.mediaDevices.getUserMedia({ video:true, audio:false });
+      })
+      .then(function(stream){
+        self.stream = stream;
+        self.track = stream.getVideoTracks()[0] || null;
+        videoEl.srcObject = stream;
+        return new Promise(function(resolve){
+          videoEl.onloadedmetadata = function(){
+            videoEl.play().catch(function(){});
+            resolve(self.getSettings());
+          };
+        });
+      });
+  },
+  getSettings: function(){
+    if (!this.track) return null;
+    var s = {};
+    try { s = this.track.getSettings() || {}; } catch(e){}
+    return s;
+  },
+  stop: function(){
+    if (this.stream){
+      this.stream.getTracks().forEach(function(t){ try{ t.stop(); }catch(e){} });
+    }
+    this.stream = null;
+    this.track = null;
+  }
+};
+
+/* =========================================================================
+   13. TIMESTAMP SCHEDULER (drift-corrected)
+   ========================================================================= */
+function TimestampScheduler(fps, callback){
+  this.frameInterval = 1000/fps;
+  this.callback = callback;
+  this.rafId = null;
+  this.nextFrameTime = null;
+  this.running = false;
+  this.frameCounter = 0;
+  this.fpsWindow = [];
+}
+TimestampScheduler.prototype.start = function(){
+  var self = this;
+  this.running = true;
+  this.nextFrameTime = now();
+  function tick(){
+    if (!self.running) return;
+    var t = now();
+    if (t >= self.nextFrameTime){
+      var overdue = t - self.nextFrameTime;
+      if (overdue > self.frameInterval*5){
+        self.nextFrameTime = t; // resync, drop backlog
+      } else {
+        self.nextFrameTime += self.frameInterval;
+      }
+      self.frameCounter++;
+      self.fpsWindow.push(t);
+      while (self.fpsWindow.length && t - self.fpsWindow[0] > 1000) self.fpsWindow.shift();
+      self.callback(t, self.frameCounter, self.fpsWindow.length);
+    }
+    self.rafId = requestAnimationFrame(tick);
+  }
+  this.rafId = requestAnimationFrame(tick);
+};
+TimestampScheduler.prototype.stop = function(){
+  this.running = false;
+  if (this.rafId) cancelAnimationFrame(this.rafId);
+  this.rafId = null;
+};
+
+/* =========================================================================
+   14. DOM REFERENCES
+   ========================================================================= */
+var el = {};
+[
+  'roleSenderBtn','roleReceiverBtn','gridSelect','fpsSelect','durationSelect','fpsField',
+  'capacityLine','senderControls','receiverControls',
+  'calibPatternBtn','senderStartBtn','senderStopBtn','senderStatusLine',
+  'enableCameraBtn','receiverStartBtn','receiverStopBtn','debugCheckbox','receiverStatusLine',
+  'receiverView','video','overlayCanvas','calibBadge','camInfo','debugPanel',
+  'stElapsed','stDetFps','stValFps','stValFrames','stPayload','stPayloadRate','stRawRate','stCrcErr','stDup','stOoo',
+  'reportBox','errorBox',
+  'senderView','senderCanvas','senderBar','senderBarLeft','senderBarMid','senderBarRight','senderExitBtn'
+].forEach(function(id){ el[id] = document.getElementById(id); });
+
+function showError(msg){
+  el.errorBox.textContent = msg;
+  el.errorBox.classList.remove('hidden');
+}
+function clearError(){
+  el.errorBox.classList.add('hidden');
+  el.errorBox.textContent = '';
+}
+function setStatusLine(node, text, cls){
+  node.textContent = text;
+  node.classList.remove('warn','err','ok');
+  if (cls) node.classList.add(cls);
+}
+
+/* =========================================================================
+   15. STATE
+   ========================================================================= */
+var state = {
+  role: 'sender', // 'sender' | 'receiver'
+  grid: 32,
+  fps: 15,
+  duration: 30
+};
+
+function currentPlan(){ return GridPlan.build(state.grid); }
+
+function updateCapacityLine(){
+  var plan = currentPlan();
+  var cap = OpticalProtocol.payloadCapacityBytes(plan);
+  var rawBytes = HEADER_BYTES + cap + CRC_BYTES;
+  el.capacityLine.textContent = cap + ' B payload / ' + rawBytes + ' B raw · marker ' + plan.markerSize + 'px-cell';
+}
+
+/* =========================================================================
+   16. ROLE SWITCHING / UI WIRING
+   ========================================================================= */
+function setRole(role){
+  state.role = role;
+  el.roleSenderBtn.classList.toggle('active', role==='sender');
+  el.roleReceiverBtn.classList.toggle('active', role==='receiver');
+  el.senderControls.classList.toggle('hidden', role!=='sender');
+  el.receiverControls.classList.toggle('hidden', role!=='receiver');
+  el.fpsField.classList.toggle('hidden', role!=='sender');
+  el.receiverView.classList.toggle('hidden', role!=='receiver');
+  el.reportBox.classList.add('hidden');
+  clearError();
+}
+el.roleSenderBtn.addEventListener('click', function(){ if(state.role!=='sender') setRole('sender'); });
+el.roleReceiverBtn.addEventListener('click', function(){ if(state.role!=='receiver') setRole('receiver'); });
+
+el.gridSelect.addEventListener('change', function(){ state.grid = parseInt(this.value,10); updateCapacityLine(); });
+el.fpsSelect.addEventListener('change', function(){ state.fps = parseInt(this.value,10); });
+el.durationSelect.addEventListener('change', function(){ state.duration = parseInt(this.value,10); });
+
+updateCapacityLine();
+setRole('sender');
+
+/* =========================================================================
+   17. SENDER CONTROLLER
+   ========================================================================= */
+var Sender = {
+  scheduler: null,
+  countdownRafId: null,
+  sequence: 0,
+  mode: 'idle', // 'idle' | 'calibration' | 'countdown' | 'benchmark'
+  startTime: 0,
+  offscreen: document.createElement('canvas'),
+
+  enterFullscreenView: function(){
+    el.senderView.classList.add('active');
+    this.resizeCanvas();
+  },
+  exitFullscreenView: function(){
+    el.senderView.classList.remove('active');
+    el.senderBar.classList.remove('countdown');
+  },
+  resizeCanvas: function(){
+    var plan = currentPlan();
+    var vw = window.innerWidth, vh = window.innerHeight - 46;
+    var side = Math.floor(Math.min(vw, vh) * 0.94);
+    side -= side % plan.G; // keep integer px per cell
+    if (side < plan.G) side = plan.G;
+    var canvas = el.senderCanvas;
+    canvas.width = side; canvas.height = side;
+    canvas.style.width = side+'px';
+    canvas.style.height = side+'px';
+    this.offscreen.width = plan.G;
+    this.offscreen.height = plan.G;
+  },
+  drawFrame: function(bytes){
+    var plan = currentPlan();
+    var imgData = FrameEncoder.renderBitmap(plan, bytes);
+    var offCtx = this.offscreen.getContext('2d');
+    offCtx.putImageData(imgData, 0, 0);
+    var ctx = el.senderCanvas.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0,0,el.senderCanvas.width, el.senderCanvas.height);
+    ctx.drawImage(this.offscreen, 0, 0, el.senderCanvas.width, el.senderCanvas.height);
+  },
+
+  showCalibrationPattern: function(){
+    this.cancelAllTimers();
+    this.mode = 'calibration';
+    this.enterFullscreenView();
+    el.senderBarLeft.textContent = 'MODE: CALIBRATION PATTERN';
+    el.senderBarMid.textContent = 'SEQ: —';
+    el.senderBarRight.textContent = 'FPS: —';
+    var plan = currentPlan();
+    var bytes = OpticalProtocol.encodeFrame(TYPE_CALIBRATION, 0, plan);
+    this.drawFrame(bytes);
+    setStatusLine(el.senderStatusLine, 'در حال نمایش الگوی کالیبراسیون (فقط نشانگرها).', null);
+  },
+
+  // Step 1: countdown. Keeps transmitting a valid TYPE_CALIBRATION frame
+  // (with markers) the whole time, so the receiver can lock on AND
+  // pre-verify the format before the timed benchmark actually begins.
+  start: function(){
+    var self = this;
+    this.cancelAllTimers();
+    this.mode = 'countdown';
+    this.sequence = 0;
+    this.enterFullscreenView();
+    el.senderStartBtn.disabled = true;
+    el.senderStopBtn.disabled = false;
+    el.senderBar.classList.add('countdown');
+    setStatusLine(el.senderStatusLine, 'شمارش معکوس شروع…', null);
+
+    var plan = currentPlan();
+    var calibBytes = OpticalProtocol.encodeFrame(TYPE_CALIBRATION, 0, plan);
+    this.drawFrame(calibBytes);
+
+    var countdownStart = now();
+    function tick(){
+      if (self.mode !== 'countdown') return; // stopped externally
+      var elapsed = now() - countdownStart;
+      var remain = COUNTDOWN_SECONDS*1000 - elapsed;
+      if (remain <= 0){
+        self.beginTransmission();
+        return;
+      }
+      var secLeft = Math.ceil(remain/1000);
+      el.senderBarLeft.textContent = 'MODE: SYNC / COUNTDOWN';
+      el.senderBarMid.textContent = 'شروع در: ' + secLeft;
+      el.senderBarRight.textContent = '';
+      self.countdownRafId = requestAnimationFrame(tick);
+    }
+    this.countdownRafId = requestAnimationFrame(tick);
+  },
+
+  // Step 2: the actual timed benchmark transmission.
+  beginTransmission: function(){
+    var self = this;
+    this.mode = 'benchmark';
+    this.sequence = 0;
+    this.startTime = now();
+    el.senderBar.classList.remove('countdown');
+    setStatusLine(el.senderStatusLine, 'در حال ارسال…', null);
+    var durationMs = state.duration * 1000;
+    this.scheduler = new TimestampScheduler(state.fps, function(t, frameCount, actualFpsCount){
+      var elapsedMs = t - self.startTime;
+      if (elapsedMs >= durationMs){
+        self.finish();
+        return;
+      }
+      var plan = currentPlan();
+      var bytes = OpticalProtocol.encodeFrame(TYPE_DATA, self.sequence, plan);
+      self.drawFrame(bytes);
+      el.senderBarLeft.textContent = 'MODE: BENCHMARK  t=' + (elapsedMs/1000).toFixed(1) + 's / ' + state.duration + 's';
+      el.senderBarMid.textContent = 'SEQ: ' + self.sequence;
+      el.senderBarRight.textContent = 'FPS(actual): ' + actualFpsCount;
+      self.sequence++;
+    });
+    this.scheduler.start();
+  },
+
+  cancelAllTimers: function(){
+    if (this.scheduler){ this.scheduler.stop(); this.scheduler = null; }
+    if (this.countdownRafId){ cancelAnimationFrame(this.countdownRafId); this.countdownRafId = null; }
+  },
+  finish: function(){
+    this.cancelAllTimers();
+    this.mode = 'idle';
+    this.exitFullscreenView();
+    el.senderStartBtn.disabled = false;
+    el.senderStopBtn.disabled = true;
+    setStatusLine(el.senderStatusLine, 'پایان یافت: ' + this.sequence + ' فریم در ' + state.duration + ' ثانیه ارسال شد.', 'ok');
+  },
+  stop: function(){
+    var wasCountdownOrRunning = (this.mode === 'countdown' || this.mode === 'benchmark');
+    this.cancelAllTimers();
+    this.mode = 'idle';
+    this.exitFullscreenView();
+    el.senderStartBtn.disabled = false;
+    el.senderStopBtn.disabled = true;
+    if (wasCountdownOrRunning){
+      setStatusLine(el.senderStatusLine, 'متوقف شد توسط کاربر. ' + this.sequence + ' فریم ارسال شد.', 'warn');
+    } else {
+      setStatusLine(el.senderStatusLine, 'Idle.', null);
+    }
+  }
+};
+
+el.calibPatternBtn.addEventListener('click', function(){ Sender.showCalibrationPattern(); });
+el.senderStartBtn.addEventListener('click', function(){ Sender.start(); });
+el.senderStopBtn.addEventListener('click', function(){ Sender.stop(); });
+el.senderExitBtn.addEventListener('click', function(){ Sender.stop(); });
+window.addEventListener('resize', function(){ if (el.senderView.classList.contains('active')) Sender.resizeCanvas(); });
+
+/* =========================================================================
+   18. STATS
+   ========================================================================= */
+function makeStats(){
+  return {
+    startTime: 0,
+    totalDetected: 0,      // TYPE_DATA frames with MAGIC recognized, any CRC outcome
+    validFrames: 0,        // unique, TYPE_DATA, CRC-ok
+    duplicateFrames: 0,
+    outOfOrder: 0,
+    crcErrors: 0,
+    payloadBytes: 0,
+    rawBytes: 0,
+    maxSeqSeen: -1,
+    seenSequences: new Set(),
+    detTimestamps: [],
+    valTimestamps: []
+  };
+}
+
+/* =========================================================================
+   19. RECEIVER CONTROLLER
+   ========================================================================= */
+var Receiver = {
+  cameraReady: false,
+  phase: 'idle', // idle | searching | locked | verified | countdown | running
+  calibConsecOk: 0,
+  calibConsecFail: 0,
+  formatHits: [],        // timestamps of recent valid (magicOk && crcOk) decodes, any type
+  countdownStart: 0,
+  countdownAbortReason: null,
+  rafId: null,
+  stats: makeStats(),
+  durationMs: 0,
+  procCanvas: document.createElement('canvas'),
+
+  enableCamera: function(){
+    var self = this;
+    setStatusLine(el.receiverStatusLine, 'در حال درخواست دسترسی به دوربین…', null);
+    clearError();
+    if (location.protocol === 'file:'){
+      setStatusLine(el.receiverStatusLine, 'هشدار: اجرا از file:// — برخی مرورگرها دسترسی دوربین را در این حالت محدود می‌کنند.', 'warn');
+    }
+    CameraManager.start(el.video).then(function(settings){
+      self.cameraReady = true;
+      el.enableCameraBtn.disabled = true;
+      var w = settings && settings.width ? settings.width : (el.video.videoWidth||0);
+      var h = settings && settings.height ? settings.height : (el.video.videoHeight||0);
+      var fr = settings && settings.frameRate ? settings.frameRate.toFixed(0) : '?';
+      el.camInfo.textContent = 'Camera: ' + w + ' × ' + h + ' @ ' + fr + ' FPS';
+      self.sizeCanvases();
+      self.setPhase('searching');
+      self.runLoop();
+    }).catch(function(err){
+      var msg;
+      if (err && err.message === 'NO_MEDIA_API'){
+        msg = 'This browser does not support the Camera API (navigator.mediaDevices.getUserMedia).';
+      } else if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')){
+        msg = 'Camera permission denied, or blocked by the page context (e.g. file://). Please allow camera access or serve this file over http(s)://';
+      } else if (err && err.name === 'NotFoundError'){
+        msg = 'No camera device found.';
+      } else {
+        msg = 'Camera error: ' + (err && err.message ? err.message : String(err));
+      }
+      showError(msg);
+      setStatusLine(el.receiverStatusLine, 'دوربین فعال نیست.', null);
+    });
+  },
+
+  sizeCanvases: function(){
+    var vw = el.video.videoWidth || 640, vh = el.video.videoHeight || 480;
+    var pw = Math.min(PROCESSING_MAX_WIDTH, vw);
+    var ph = Math.round(pw * vh / vw);
+    this.procCanvas.width = pw;
+    this.procCanvas.height = ph;
+    el.overlayCanvas.width = el.video.clientWidth || vw;
+    el.overlayCanvas.height = el.video.clientHeight || vh;
+  },
+
+  captureProcessingFrame: function(){
+    var ctx = this.procCanvas.getContext('2d');
+    ctx.drawImage(el.video, 0, 0, this.procCanvas.width, this.procCanvas.height);
+    return ctx.getImageData(0, 0, this.procCanvas.width, this.procCanvas.height);
+  },
+
+  setCalibBadge: function(cls, text){
+    el.calibBadge.className = 'calib-badge ' + cls;
+    el.calibBadge.textContent = text;
+  },
+
+  clearOverlay: function(){
+    var ctx = el.overlayCanvas.getContext('2d');
+    ctx.clearRect(0,0,el.overlayCanvas.width, el.overlayCanvas.height);
+  },
+
+  drawOverlay: function(loc, decodeInfo, failReason){
+    var ctx = el.overlayCanvas.getContext('2d');
+    var ow = el.overlayCanvas.width, oh = el.overlayCanvas.height;
+    ctx.clearRect(0,0,ow,oh);
+    if (loc && loc.success){
+      var sx = ow / this.procCanvas.width;
+      var sy = oh / this.procCanvas.height;
+      var pts = [loc.corners.TL, loc.corners.TR, loc.corners.BR, loc.corners.BL];
+      ctx.strokeStyle = '#4fd1c5';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x*sx, pts[0].y*sy);
+      for (var i=1;i<pts.length;i++) ctx.lineTo(pts[i].x*sx, pts[i].y*sy);
+      ctx.closePath();
+      ctx.stroke();
+      ctx.fillStyle = '#ffb454';
+      var raw = [loc.corners.TL, loc.corners.TR, loc.corners.BL, loc.corners.BR];
+      for (var j=0;j<raw.length;j++){
+        ctx.beginPath();
+        ctx.arc(raw[j].x*sx, raw[j].y*sy, 4, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+    if (el.debugCheckbox.checked){
+      var dbgLines = [];
+      dbgLines.push('phase: ' + this.phase);
+      dbgLines.push('format hits (last ' + FORMAT_VERIFY_WINDOW_MS + 'ms): ' + this.formatHits.length + '/' + FORMAT_VERIFY_MIN_SUCCESS);
+      if (loc && loc.success){
+        dbgLines.push('Detected corners:');
+        dbgLines.push(' TL ' + Math.round(loc.corners.TL.x) + ',' + Math.round(loc.corners.TL.y));
+        dbgLines.push(' TR ' + Math.round(loc.corners.TR.x) + ',' + Math.round(loc.corners.TR.y));
+        dbgLines.push(' BR ' + Math.round(loc.corners.BR.x) + ',' + Math.round(loc.corners.BR.y));
+        dbgLines.push(' BL ' + Math.round(loc.corners.BL.x) + ',' + Math.round(loc.corners.BL.y));
+      } else {
+        dbgLines.push('locate failed: ' + (failReason || 'unknown'));
+      }
+      if (decodeInfo){
+        dbgLines.push('MAGIC: ' + (decodeInfo.magicOk ? 'OK' : 'FAIL'));
+        dbgLines.push('TYPE: ' + decodeInfo.type + '  SEQ: ' + decodeInfo.sequence + '  LEN: ' + decodeInfo.length);
+        dbgLines.push('CRC: ' + (decodeInfo.crcOk ? 'OK' : 'FAIL'));
+      }
+      el.debugPanel.classList.remove('hidden');
+      el.debugPanel.textContent = dbgLines.join('\n');
+    } else {
+      el.debugPanel.classList.add('hidden');
+    }
+  },
+
+  // Full pipeline: locate markers -> homography -> sample bits -> decode.
+  // Returns { locateFailed:true, reason } or { locateFailed:false, decoded }.
+  decodeOneFrame: function(){
+    var plan = currentPlan();
+    var imgData = this.captureProcessingFrame();
+    var gray = ImageOps.toGrayscale(imgData);
+    var loc = FrameLocator.locate(gray, this.procCanvas.width, this.procCanvas.height);
+    if (!loc.success){
+      this.drawOverlay(loc, null, loc.reason);
+      return { locateFailed:true, reason: loc.reason };
+    }
+    var S = plan.canonicalSize;
+    var srcCanonical = [ {x:0,y:0}, {x:S,y:0}, {x:0,y:S}, {x:S,y:S} ];
+    var dstImage = [ loc.corners.TL, loc.corners.TR, loc.corners.BL, loc.corners.BR ];
+    var H = Homography.compute(srcCanonical, dstImage);
+    if (!H){
+      this.drawOverlay(loc, null, 'homography_singular');
+      return { locateFailed:true, reason:'homography_singular' };
+    }
+    var w = this.procCanvas.width, h = this.procCanvas.height;
+
+    function sampleAt(cx0, cy0){
+      var p = Homography.apply(H, cx0, cy0);
+      if (!p) return null;
+      var ix = Math.round(p.x), iy = Math.round(p.y);
+      if (ix < 1 || iy < 1 || ix >= w-1 || iy >= h-1) return null;
+      var sum = 0, cnt = 0;
+      for (var dy=-1; dy<=1; dy++){
+        for (var dx=-1; dx<=1; dx++){
+          sum += gray[(iy+dy)*w + (ix+dx)]; cnt++;
+        }
+      }
+      return sum/cnt;
+    }
+
+    // white reference from quiet cells (subsampled for speed)
+    var quiet = plan.quietCells;
+    var step = Math.max(1, Math.floor(quiet.length / 12));
+    var whiteSum = 0, whiteCnt = 0;
+    for (var qi=0; qi<quiet.length; qi += step){
+      var qc = quiet[qi];
+      var cxp = qc.c*plan.cellPx + plan.cellPx/2;
+      var cyp = qc.r*plan.cellPx + plan.cellPx/2;
+      var val = sampleAt(cxp, cyp);
+      if (val !== null){ whiteSum += val; whiteCnt++; }
+    }
+    var whiteRef = whiteCnt > 0 ? whiteSum/whiteCnt : 200;
+    var blackRef = loc.blackRef;
+    var threshold = (blackRef < whiteRef) ? (blackRef+whiteRef)/2 : loc.threshold;
+
+    var dataCells = plan.dataCells;
+    var bits = new Uint8Array(dataCells.length);
+    var validSamples = 0;
+    for (var k=0;k<dataCells.length;k++){
+      var cell = dataCells[k];
+      var cxp2 = cell.c*plan.cellPx + plan.cellPx/2;
+      var cyp2 = cell.r*plan.cellPx + plan.cellPx/2;
+      var v = sampleAt(cxp2, cyp2);
+      if (v === null){ bits[k] = 1; continue; }
+      validSamples++;
+      bits[k] = (v < threshold) ? 0 : 1;
+    }
+    if (validSamples < dataCells.length * 0.5){
+      this.drawOverlay(loc, null, 'insufficient_samples');
+      return { locateFailed:true, reason:'insufficient_samples' };
+    }
+
+    var bytes = BitUtils.bitsToBytes(bits);
+    var decoded = OpticalProtocol.decodeFrame(bytes);
+    this.drawOverlay(loc, decoded.magicOk ? decoded : null, null);
+    return { locateFailed:false, decoded: decoded };
+  },
+
+  // ---- Phase management -----------------------------------------------
+  setPhase: function(p){
+    this.phase = p;
+    if (p === 'countdown' || p === 'running') return; // those manage their own badge/status text per-frame
+    switch(p){
+      case 'searching':
+        this.setCalibBadge('waiting', 'در جستجوی نشانگر نوری…');
+        setStatusLine(el.receiverStatusLine, 'دوربین فعال است — منتظر یافتن نشانگرهای فرستنده.', null);
+        el.receiverStartBtn.disabled = true;
+        break;
+      case 'locked':
+        this.setCalibBadge('progress', 'نشانگر پیدا شد — بررسی فرمت داده…');
+        setStatusLine(el.receiverStatusLine, 'نشانگرها قفل شدند. در حال تأیید فرمت (' + this.formatHits.length + '/' + FORMAT_VERIFY_MIN_SUCCESS + ')… مطمئن شوید Grid دو دستگاه یکسان است.', 'warn');
+        el.receiverStartBtn.disabled = true;
+        break;
+      case 'verified':
+        this.setCalibBadge('ok', 'متصل ✅ آماده شروع');
+        setStatusLine(el.receiverStatusLine, 'ارتباط نوری تأیید شد. آماده‌ی شروع تست.', 'ok');
+        el.receiverStartBtn.disabled = false;
+        break;
+      default:
+        break;
+    }
+  },
+
+  // Runs during searching/locked/verified/countdown to keep link status live.
+  monitorStep: function(){
+    var result = this.decodeOneFrame();
+    var t = now();
+    if (result.locateFailed){
+      this.calibConsecFail++; this.calibConsecOk = 0;
+      if (this.calibConsecFail >= LOST_CALIB_FRAMES && this.phase !== 'searching'){
+        this.formatHits = [];
+        this.setPhase('searching');
+      }
+    } else {
+      this.calibConsecOk++; this.calibConsecFail = 0;
+      if (this.calibConsecOk >= STABLE_CALIB_FRAMES && (this.phase === 'searching' || this.phase === 'idle')){
+        this.setPhase('locked');
+      }
+      var d = result.decoded;
+      if (d && d.magicOk && d.crcOk){
+        this.formatHits.push(t);
+      }
+    }
+    while (this.formatHits.length && t - this.formatHits[0] > FORMAT_VERIFY_WINDOW_MS) this.formatHits.shift();
+    var verified = this.formatHits.length >= FORMAT_VERIFY_MIN_SUCCESS;
+    if (verified && this.phase === 'locked'){
+      this.setPhase('verified');
+    } else if (!verified && this.phase === 'verified'){
+      this.setPhase(this.calibConsecOk > 0 ? 'locked' : 'searching');
+    } else if (this.phase === 'locked'){
+      // refresh the "x/3" counter text while waiting
+      this.setCalibBadge('progress', 'نشانگر پیدا شد — بررسی فرمت داده… (' + this.formatHits.length + '/' + FORMAT_VERIFY_MIN_SUCCESS + ')');
+    }
+    return result;
+  },
+
+  // ---- Start / Stop -----------------------------------------------------
+  beginCountdown: function(){
+    if (this.phase !== 'verified') return;
+    this.phase = 'countdown';
+    this.countdownStart = now();
+    this.countdownAbortReason = null;
+    el.receiverStartBtn.disabled = true;
+    el.receiverStopBtn.disabled = false;
+    el.reportBox.classList.add('hidden');
+    setStatusLine(el.receiverStatusLine, 'آماده باشید — تست به‌زودی شروع می‌شود.', 'ok');
+  },
+
+  beginRealBenchmark: function(){
+    this.phase = 'running';
+    this.stats = makeStats();
+    this.stats.startTime = now();
+    this.durationMs = state.duration * 1000;
+    setStatusLine(el.receiverStatusLine, 'تست در حال اجراست…', 'ok');
+    this.setCalibBadge('ok', 'در حال دریافت داده…');
+  },
+
+  finishBenchmark: function(userInitiated){
+    this.phase = (this.calibConsecOk > 0) ? 'locked' : 'searching';
+    // do not claim "verified" again until monitorStep proves it fresh
+    this.formatHits = [];
+    el.receiverStartBtn.disabled = true; // will re-enable once re-verified
+    el.receiverStopBtn.disabled = true;
+    setStatusLine(el.receiverStatusLine, userInitiated ? 'تست توسط کاربر متوقف شد.' : 'تست کامل شد.', userInitiated ? 'warn' : 'ok');
+    this.renderFinalReport();
+  },
+
+  userStop: function(){
+    if (this.phase === 'countdown'){
+      this.phase = (this.calibConsecOk > 0) ? 'locked' : 'searching';
+      el.receiverStartBtn.disabled = true;
+      el.receiverStopBtn.disabled = true;
+      setStatusLine(el.receiverStatusLine, 'شمارش معکوس لغو شد.', 'warn');
+    } else if (this.phase === 'running'){
+      this.finishBenchmark(true);
+    }
+  },
+
+  // ---- Main loop ----------------------------------------------------------
+  runLoop: function(){
+    var self = Receiver;
+    if (!self.cameraReady){ return; }
+    self.sizeCanvases();
+
+    if (self.phase === 'running'){
+      var t = now();
+      var elapsed = t - self.stats.startTime;
+      if (elapsed >= self.durationMs){
+        self.finishBenchmark(false);
+      } else {
+        var result = self.decodeOneFrame();
+        if (!result.locateFailed){
+          var d = result.decoded;
+          // Only TYPE_DATA frames are counted toward benchmark statistics.
+          // (Calibration/idle frames seen mid-test are ignored — this was
+          // a real bug that could corrupt results.)
+          if (d.magicOk && d.type === TYPE_DATA){
+            self.stats.totalDetected++;
+            self.stats.detTimestamps.push(t);
+            if (d.crcOk){
+              var seq = d.sequence;
+              if (self.stats.seenSequences.has(seq)){
+                self.stats.duplicateFrames++;
+              } else {
+                self.stats.seenSequences.add(seq);
+                self.stats.validFrames++;
+                self.stats.valTimestamps.push(t);
+                self.stats.payloadBytes += d.length;
+                self.stats.rawBytes += (HEADER_BYTES + d.length + CRC_BYTES);
+                if (seq < self.stats.maxSeqSeen) self.stats.outOfOrder++;
+                if (seq > self.stats.maxSeqSeen) self.stats.maxSeqSeen = seq;
+              }
+            } else {
+              self.stats.crcErrors++;
+            }
+          }
+        }
+        self.updateLiveDashboard(elapsed);
+      }
+    } else if (self.phase === 'countdown'){
+      self.monitorStep(); // keep checking the link during countdown
+      if (self.phase !== 'countdown'){
+        // link degraded mid-countdown — monitorStep already changed phase
+        setStatusLine(el.receiverStatusLine, 'ارتباط در حین شمارش معکوس ضعیف/قطع شد — دوباره تلاش کنید.', 'err');
+        el.receiverStopBtn.disabled = true;
+      } else {
+        var remain = COUNTDOWN_SECONDS*1000 - (now() - self.countdownStart);
+        if (remain <= 0){
+          self.beginRealBenchmark();
+        } else {
+          self.setCalibBadge('ok', 'شروع در: ' + Math.ceil(remain/1000));
+        }
+      }
+    } else {
+      self.monitorStep();
+    }
+    self.rafId = requestAnimationFrame(self.runLoop);
+  },
+
+  updateLiveDashboard: function(elapsedMs){
+    var elapsedSec = elapsedMs/1000;
+    var st = this.stats;
+    var t = now();
+    while (st.detTimestamps.length && t - st.detTimestamps[0] > 1000) st.detTimestamps.shift();
+    while (st.valTimestamps.length && t - st.valTimestamps[0] > 1000) st.valTimestamps.shift();
+    var detFps = st.detTimestamps.length;
+    var valFps = st.valTimestamps.length;
+    var payloadKiB = st.payloadBytes/1024;
+    var rawKiB = st.rawBytes/1024;
+    var payloadRate = elapsedSec>0 ? payloadKiB/elapsedSec : 0;
+    var rawRate = elapsedSec>0 ? rawKiB/elapsedSec : 0;
+
+    el.stElapsed.textContent = elapsedSec.toFixed(2) + ' sec';
+    el.stDetFps.textContent = detFps.toFixed(1);
+    el.stValFps.textContent = valFps.toFixed(1);
+    el.stValFrames.textContent = String(st.validFrames);
+    el.stPayload.textContent = payloadKiB.toFixed(1) + ' KiB';
+    el.stPayloadRate.textContent = payloadRate.toFixed(2) + ' KiB/s';
+    el.stRawRate.textContent = rawRate.toFixed(2) + ' KiB/s';
+    el.stCrcErr.textContent = String(st.crcErrors);
+    el.stDup.textContent = String(st.duplicateFrames);
+    el.stOoo.textContent = String(st.outOfOrder);
+  },
+
+  renderFinalReport: function(){
+    var st = this.stats;
+    var elapsedSec = (now() - st.startTime)/1000;
+    var plan = currentPlan();
+    var payloadKiB = st.payloadBytes/1024;
+    var payloadRate = elapsedSec>0 ? payloadKiB/elapsedSec : 0;
+    var payloadBitrateKbit = elapsedSec>0 ? (st.payloadBytes*8/1000)/elapsedSec : 0;
+    var rawRate = elapsedSec>0 ? (st.rawBytes/1024)/elapsedSec : 0;
+    var effectiveFps = elapsedSec>0 ? st.validFrames/elapsedSec : 0;
+
+    function pad(label, value){
+      return label + ':\n' + value + '\n';
+    }
+    var lines = [];
+    lines.push('========== TEST RESULT ==========');
+    lines.push(pad('Duration', elapsedSec.toFixed(2) + ' sec'));
+    lines.push(pad('Grid', plan.G + ' × ' + plan.G));
+    lines.push(pad('Target FPS (this device setting)', String(state.fps)));
+    lines.push(pad('Detected Frames', String(st.totalDetected)));
+    lines.push(pad('Valid Frames', String(st.validFrames)));
+    lines.push(pad('Duplicate Frames', String(st.duplicateFrames)));
+    lines.push(pad('Out-of-Order Frames', String(st.outOfOrder)));
+    lines.push(pad('CRC Errors', String(st.crcErrors)));
+    lines.push(pad('Payload', payloadKiB.toFixed(2) + ' KiB'));
+    lines.push(pad('Average Payload Rate', payloadRate.toFixed(3) + ' KiB/s'));
+    lines.push(pad('Average Payload Bitrate', payloadBitrateKbit.toFixed(2) + ' Kbit/s'));
+    lines.push(pad('Average Raw Rate', rawRate.toFixed(3) + ' KiB/s'));
+    lines.push(pad('Effective FPS', effectiveFps.toFixed(2)));
+    lines.push('==================================');
+    if (st.validFrames === 0){
+      lines.push('');
+      lines.push('توجه: هیچ فریم معتبری دریافت نشد. قبل از تلاش دوباره بررسی کنید:');
+      lines.push(' - Grid هر دو دستگاه دقیقاً یکسان انتخاب شده باشد.');
+      lines.push(' - فرستنده واقعاً روی حالت BENCHMARK بوده (نه idle).');
+      lines.push(' - فاصله/زاویه/نور طوری باشد که هر ۴ نشانگر گوشه در دوربین واضح دیده شوند.');
+    }
+    el.reportBox.textContent = lines.join('\n');
+    el.reportBox.classList.remove('hidden');
+  }
+};
+
+el.enableCameraBtn.addEventListener('click', function(){ Receiver.enableCamera(); });
+el.receiverStartBtn.addEventListener('click', function(){ Receiver.beginCountdown(); });
+el.receiverStopBtn.addEventListener('click', function(){ Receiver.userStop(); });
+el.debugCheckbox.addEventListener('change', function(){
+  if (!el.debugCheckbox.checked) el.debugPanel.classList.add('hidden');
+});
+
+/* =========================================================================
+   20. CLEANUP
+   ========================================================================= */
+function cleanup(){
+  Sender.cancelAllTimers();
+  if (Receiver.rafId) cancelAnimationFrame(Receiver.rafId);
+  Receiver.rafId = null;
+  CameraManager.stop();
+}
+window.addEventListener('beforeunload', cleanup);
+window.addEventListener('pagehide', cleanup);
+
+})();
+</script>
+</body>
+</html>
